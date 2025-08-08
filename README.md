@@ -1,5 +1,5 @@
 
-# Capemouse (v5.9 failsafe)
+# Capemouse (v5.9 failsafe) 
 
 Single-file HTML game optimized for iOS Safari and static hosting.
 
