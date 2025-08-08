@@ -1,0 +1,492 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+<title>Capemouse v5.9 (failsafe)</title>
+<style>
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none}
+body{margin:0;background:#0a0a1a;color:#eee;font-family:system-ui,Arial,Helvetica,sans-serif;touch-action:none;-webkit-tap-highlight-color:rgba(0,0,0,0)}
+#game{display:block;margin:0 auto;background:#6ec1ff;image-rendering:pixelated;image-rendering:crisp-edges;max-width:100vw;height:auto}
+#ui{position:fixed;inset:0;pointer-events:auto;z-index:9999}
+.panel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#111a;padding:16px 20px;border:1px solid #fff2;border-radius:10px;backdrop-filter:blur(6px);max-width:92vw}
+.levels{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;margin-bottom:10px}
+.levels .locked{opacity:0.5}
+button{background:#222;border:1px solid #fff3;color:#fff;padding:10px 12px;border-radius:8px;cursor:pointer}
+button:active{transform:scale(0.98)}
+.hidden{display:none}
+#controls{position:fixed;inset:0;pointer-events:none;z-index:9000}
+#controls .pad{position:absolute;bottom:18px;display:flex;gap:12px;pointer-events:auto}
+#controls .pad.left{left:18px}
+#controls .pad.right{right:18px}
+#controls button{width:64px;height:64px;border-radius:999px;border:1px solid #fff4;background:#111a;color:#fff;font-size:20px}
+@media (min-width:1000px){#controls{display:none}}
+#debug{position:fixed;left:8px;bottom:8px;color:#0f0;background:#001a00;border:1px solid #0f04;padding:6px 8px;border-radius:6px;font:12px ui-monospace,Menlo,Consolas,monospace;z-index:10000;max-width:92vw;max-height:40vh;overflow:auto;white-space:pre-wrap;opacity:.9}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="mainMenu" class="panel">
+    <h1>Capemouse</h1>
+    <p>Tap once to enable audio, then Play. If Play doesn't work, it will auto-start in ~1s.</p>
+    <button id="btnPlay">Play</button>
+    <button id="btnLevels">Level Select</button>
+  </div>
+  <div id="menu" class="panel hidden">
+    <h2>Level Select</h2>
+    <div id="levels" class="levels"></div>
+    <hr/>
+    <h3>Choose Mouse</h3>
+    <div class="chars">
+      <button data-char="balanced">Ari (balanced)</button>
+      <button data-char="jumper">Pip (high jump)</button>
+      <button data-char="fast">Jet (fast run)</button>
+      <button data-char="glide">Mira (floaty)</button>
+    </div>
+    <button id="startBtn">Start Level</button>
+    <button id="backMain">Back</button>
+  </div>
+</div>
+
+<canvas id="game" width="960" height="540"></canvas>
+
+<div id="controls">
+  <div class="pad left">
+    <button id="btnLeft">◀</button>
+    <button id="btnRight">▶</button>
+  </div>
+  <div class="pad right">
+    <button id="btnGrab">⛶</button>
+    <button id="btnJump">⤴</button>
+    <button id="btnDown">⬇</button>
+  </div>
+</div>
+
+<div id="debug">Booting…</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function(){
+const debugEl = document.getElementById('debug');
+function log(){ const s=[...arguments].map(x=>typeof x==='object'?JSON.stringify(x):String(x)).join(' '); debugEl.textContent += (s+"\n"); debugEl.scrollTop=debugEl.scrollHeight; }
+log('DOMContentLoaded');
+
+// Global error trap
+window.onerror = function(msg, src, line, col, err){ log('ERROR:', msg, src+':'+line+':'+col, err && err.stack); return true; };
+window.onunhandledrejection = function(ev){ log('REJECTION:', ev && (ev.reason && ev.reason.stack || ev.reason || ev)); return true; };
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const TILE = 24;
+
+// ===== AUDIO =====
+const AC = typeof AudioContext!=='undefined' ? new AudioContext() : (typeof webkitAudioContext!=='undefined'? new webkitAudioContext(): null);
+function resumeAudio(){ try{ if(AC && AC.state==='suspended') AC.resume(); }catch(e){ log('resumeAudio error', e); } }
+function beep(type='sine', freq=440, dur=0.12, vol=0.15){
+  try{
+    if(!AC) return;
+    const now = AC.currentTime;
+    const o = AC.createOscillator(); const g = AC.createGain();
+    o.type=type; o.frequency.value=freq; g.gain.value=vol; o.connect(g); g.connect(AC.destination);
+    o.start(now); g.gain.exponentialRampToValueAtTime(0.0001, now+dur); o.stop(now+dur);
+  }catch(e){ log('beep error', e); }
+}
+const SFX = {
+  jump(){ beep('square', 620, 0.12, 0.2); },
+  coin(){ beep('square', 900, 0.08, 0.14); },
+  win(){ beep('square', 880, 0.2, 0.2); setTimeout(()=>beep('square',660,0.2,0.2),120); setTimeout(()=>beep('square',990,0.2,0.2),240); },
+  checkpoint(){ beep('triangle', 700, 0.15, 0.18); },
+  death(){ beep('sawtooth', 180, 0.25, 0.22); setTimeout(()=>beep('triangle',140,0.25,0.18),160); }
+};
+
+let musicTimer=null;
+function startMusic(){
+  try{
+    if(!AC) return; stopMusic();
+    const tempo=118, spb=60/tempo; let step=0;
+    const melody=[659,587,523,587,659,784,659,523,440,494,523,494,440];
+    musicTimer=setInterval(()=>{
+      const now = AC.currentTime;
+      const m=AC.createOscillator(), mg=AC.createGain();
+      m.type='square'; m.frequency.value=melody[step%melody.length];
+      mg.gain.value=0.06; m.connect(mg); mg.connect(AC.destination);
+      m.start(now); mg.gain.exponentialRampToValueAtTime(0.0001, now+spb*0.9); m.stop(now+spb*0.9);
+      const b=AC.createOscillator(), bg=AC.createGain();
+      b.type='triangle'; b.frequency.value=(step%4<2)?130:164;
+      bg.gain.value=0.05; b.connect(bg); bg.connect(AC.destination);
+      b.start(now); bg.gain.exponentialRampToValueAtTime(0.0001, now+spb*0.9); b.stop(now+spb*0.9);
+      step++;
+    }, spb*1000);
+  }catch(e){ log('startMusic error', e); }
+}
+function stopMusic(){ if(musicTimer){ clearInterval(musicTimer); musicTimer=null;}}
+
+// ===== INPUT =====
+const btnLeft  = document.getElementById('btnLeft');
+const btnRight = document.getElementById('btnRight');
+const btnJump  = document.getElementById('btnJump');
+const btnGrab  = document.getElementById('btnGrab');
+const btnDown  = document.getElementById('btnDown');
+
+const input = {left:false,right:false,up:false,down:false,jump:false,grab:false,_prevJump:false};
+function bindHold(btn, prop){
+  const on = (e)=>{ try{e.preventDefault();}catch(_){} input[prop]=true; resumeAudio(); };
+  const off= (e)=>{ try{e.preventDefault();}catch(_){} input[prop]=false; };
+  ['touchstart','mousedown'].forEach(ev=>btn.addEventListener(ev,on,{passive:false}));
+  ['touchend','touchcancel','mouseup','mouseleave'].forEach(ev=>btn.addEventListener(ev,off,{passive:false}));
+}
+bindHold(btnLeft,'left'); bindHold(btnRight,'right'); bindHold(btnJump,'jump'); bindHold(btnGrab,'grab'); bindHold(btnDown,'down');
+
+window.addEventListener('keydown', e=>{
+  if(e.repeat) return; resumeAudio();
+  if (['ArrowLeft','KeyA'].includes(e.code)) input.left=true;
+  if (['ArrowRight','KeyD'].includes(e.code)) input.right=true;
+  if (['ArrowUp','KeyW'].includes(e.code)) input.up=true;
+  if (['ArrowDown','KeyS'].includes(e.code)) input.down=true;
+  if (['KeyZ','Space'].includes(e.code)) input.jump=true;
+  if (e.code==='KeyX') input.grab=true;
+});
+window.addEventListener('keyup', e=>{
+  if (['ArrowLeft','KeyA'].includes(e.code)) input.left=false;
+  if (['ArrowRight','KeyD'].includes(e.code)) input.right=false;
+  if (['ArrowUp','KeyW'].includes(e.code)) input.up=false;
+  if (['ArrowDown','KeyS'].includes(e.code)) input.down=false;
+  if (['KeyZ','Space'].includes(e.code)) input.jump=false;
+  if (e.code==='KeyX') input.grab=false;
+});
+
+// ===== UI =====
+const mainMenu = document.getElementById('mainMenu');
+const menu = document.getElementById('menu');
+const btnPlay = document.getElementById('btnPlay');
+const btnLevels = document.getElementById('btnLevels');
+const startBtn = document.getElementById('startBtn');
+const backMain = document.getElementById('backMain');
+
+function onTap(el, handler){
+  if(!el) return;
+  let recentTouch=0;
+  const ts=(e)=>{ recentTouch=Date.now(); try{e.preventDefault();}catch(_){} handler(e); };
+  const cl=(e)=>{ if (Date.now()-recentTouch<600) return; try{e.preventDefault();}catch(_){} handler(e); };
+  el.addEventListener('touchstart', ts, {passive:false});
+  el.addEventListener('click', cl);
+}
+
+let selectedChar='balanced';
+menu.addEventListener('click',(e)=>{
+  const b=e.target.closest('button[data-char]'); if(b){ selectedChar=b.dataset.char; log('Char ',selectedChar); }
+  const lvlBtn = e.target.closest('button[data-level]'); if(lvlBtn && !lvlBtn.disabled){ currentLevelIndex=+lvlBtn.dataset.level; updateLevelButtons(); log('Level pick ',currentLevelIndex); }
+});
+
+onTap(btnPlay, ()=>{ log('Play tapped'); resumeAudio(); hideAllPanels(); currentLevelIndex=Math.min(progress.unlocked-1, levels.length-1); startGame(); });
+onTap(btnLevels, ()=>{ log('Levels tapped'); hideAllPanels(); showPanel(menu); updateLevelButtons(); });
+onTap(backMain, ()=>{ log('Back tapped'); hideAllPanels(); showPanel(mainMenu); });
+onTap(startBtn, ()=>{ log('Start Level tapped'); hideAllPanels(); startGame(); });
+
+function hideAllPanels(){ [mainMenu,menu].forEach(p=>p.classList.add('hidden')); }
+function showPanel(el){ el.classList.remove('hidden'); }
+
+// ===== PROGRESS =====
+const LSKEY='capemouse_progress_v59';
+let progress={ unlocked:1, coinsTotal:0 };
+try{ const s=JSON.parse(localStorage.getItem(LSKEY)||'null'); if(s && s.unlocked) progress=s; log('Progress loaded'); }catch(e){ log('Progress load error', e); }
+function saveProgress(){ try{ localStorage.setItem(LSKEY, JSON.stringify(progress)); }catch(e){ log('Progress save error', e); } }
+
+function updateLevelButtons(){
+  const container=document.getElementById('levels'); container.innerHTML='';
+  for(let i=0;i<levels.length;i++){
+    const unlocked=(i<progress.unlocked);
+    const btn=document.createElement('button');
+    btn.dataset.level=i; btn.textContent= unlocked? `Level ${i+1}`:`Level ${i+1} 🔒`;
+    btn.className=unlocked?'':'locked'; btn.disabled=!unlocked;
+    container.appendChild(btn);
+  }
+}
+
+// ===== WORLD =====
+const tile={ EMPTY:0, SOLID:1, ONEWAY:8, GOAL:9, COIN:10, CHECK:11 };
+function levelFromPlan(plan){
+  const rows = plan.trim().split('\n').map(r=>r.split('').map(c=>{
+    switch(c){
+      case '#': return tile.SOLID;
+      case '=': return tile.ONEWAY;
+      case '*': return tile.COIN;
+      case 'g': return tile.GOAL;
+      case 'k': return tile.CHECK;
+      default: return tile.EMPTY;
+    }
+  }));
+  return {w:rows[0].length, h:rows.length, grid:rows};
+}
+const LEVEL1 = levelFromPlan(`
+.................................................................................................g...............................................
+................................................................................................................................................
+................................................................................................................................................
+................................................................................................................................................
+...........*.....................====...................................................*........................................................
+............................====...............................................................................====.............................
+.................====.............................................k.................................................====..........................
+................................................................................................................................................
+.........====..................................................====.................................................................====.........
+................................................................................................................................................
+................................................................................................................................................
+######################################..########################################..########################################..#####################
+######################################..########################################..########################################..#####################
+######################################..########################################..########################################..#####################
+######################################..########################################..########################################..#####################
+######################################..########################################..########################################..#####################
+######################################..########################################..########################################..#####################
+`);
+const LEVEL2 = levelFromPlan(`
+................................................................................................................................................
+................................................................................................................................................
+................................................................................................................................................
+................................................................................................................................................
+........*......................====...................k...........................====......................................................g....
+..........................====..................................................................................====............................
+..............====........................................................................====..................................................
+...............................................====....................................................====.....................................
+.......................................................................................................................====.....................
+.......................................................====.....................................................................................
+................................................................................................................................................
+#################################################################################################################################################
+#################################################################################################################################################
+#################################################################################################################################################
+#################################################################################################################################################
+#################################################################################################################################################
+#################################################################################################################################################
+`);
+const LEVEL3 = levelFromPlan(`
+................................................................................................................................................
+................................................................................................................................................
+................................................................................................................................................
+................................................................................................................................................
+...........*....................====......................................k..............................====....................g...............
+..........................====..................................................................====...........................................
+........====.........................................................................====.......................................................
+.....................................====..............................................................====.....................................
+........................................................====.........................................................====.......................
+.................................................====...........................................................................................
+................................................................................................................................................
+########################################..##########################################..########################################..#################
+########################################..##########################################..########################################..#################
+########################################..##########################################..########################################..#################
+########################################..##########################################..########################################..#################
+########################################..##########################################..########################################..#################
+########################################..##########################################..########################################..#################
+`);
+const levels=[LEVEL1,LEVEL2,LEVEL3];
+let currentLevelIndex=Math.min(progress.unlocked-1, levels.length-1);
+let currentLevel=levels[currentLevelIndex];
+
+// ===== Textures & Scenery =====
+const tex={};
+function makePattern(colors){
+  const c=document.createElement('canvas'); c.width=8; c.height=8;
+  const g=c.getContext('2d');
+  g.fillStyle=colors[0]; g.fillRect(0,0,8,8);
+  g.fillStyle=colors[1]; g.fillRect(0,0,8,1); g.fillRect(0,0,1,8);
+  g.fillStyle=colors[2]; g.fillRect(7,0,1,8); g.fillRect(0,7,8,1);
+  return ctx.createPattern(c,'repeat');
+}
+function initTex(){
+  tex.sky   = '#8bd0ff';
+  tex.solid = makePattern(['#6c4a2e','#7a5536','#5b3d25']);
+  tex.one   = makePattern(['#4a47ff','#6967ff','#2e2cff']);
+  tex.flag  = makePattern(['#ffd54a','#ffe376','#f0c232']);
+  tex.coin  = makePattern(['#ffd76e','#ffe69a','#f0c34f']);
+  tex.check = makePattern(['#57e2ff','#79efff','#39c7e0']);
+}
+const scenery=[];
+function buildScenery(){
+  scenery.length=0;
+  for(let i=0;i<12;i++){ scenery.push({k:0.15, cloud:true, x=i*220+50, y:80, w:80, h:12}); }
+  for(let i=0;i<10;i++){ scenery.push({k:0.28, hill:true, x=i*360, y:380, r:140, color:'#78d27a'}); }
+}
+
+// ===== Entities & Player =====
+const ents=[];
+let camera={x:0,y:0};
+let gameState='menu';
+let coinsCollected=0;
+let lives=3;
+let respawn={x:6*TILE,y:6*TILE};
+
+const charStats={ balanced:{run:0.12,jump:4.8,grav:0.22,fallMax:6.0}, jumper:{run:0.11,jump:5.8,grav:0.22,fallMax:6.2}, fast:{run:0.16,jump:4.4,grav:0.24,fallMax:6.6}, glide:{run:0.11,jump:4.2,grav:0.18,fallMax:4.2} };
+const player={x:6*TILE,y:6*TILE,w:16,h:18,vx:0,vy:0,dir:1,onGround:false,jumpsLeft:2,anim:0,frame:0,stats:charStats.balanced};
+
+function resetPlayer(){ Object.assign(player,{x:respawn.x,y:respawn.y,vx:0,vy:0,dir:1,onGround:false,jumpsLeft:2,anim:0,frame:0,stats:charStats[selectedChar]||charStats.balanced}); }
+function AABB(a,b){ return !(a.x+a.w<b.x || b.x+b.w<a.x || a.y+a.h<b.y || b.y+b.h<a.y); }
+function solidAtRect(x,y,w,h,lvl=currentLevel){
+  const x0=Math.floor(x/TILE),x1=Math.floor((x+w-1)/TILE);
+  const y0=Math.floor(y/TILE),y1=Math.floor((y+h-1)/TILE);
+  for(let ty=y0; ty<=y1; ty++) for(let tx=x0; tx<=x1; tx++){ const t=(ty<0||tx<0||ty>=lvl.h||tx>=lvl.w)?1:lvl.grid[ty][tx]; if (t===1) return true; }
+  return false;
+}
+function onewayAtRect(x,y,w,h,lvl=currentLevel){
+  const x0=Math.floor(x/TILE),x1=Math.floor((x+w-1)/TILE);
+  const y1=Math.floor((y+h-1)/TILE);
+  for(let tx=x0; tx<=x1; tx++){ const t=lvl.grid[y1] && lvl.grid[y1][tx]; if (t===8) return true; }
+  return false;
+}
+function movePlayer(){
+  const s=player.stats;
+  player.vy += s.grav; player.vy=Math.min(player.vy,s.fallMax);
+  player.x += player.vx;
+  if (solidAtRect(player.x,player.y,player.w,player.h)){ player.x -= player.vx; while(!solidAtRect(player.x+Math.sign(player.vx),player.y,player.w,player.h)) player.x+=Math.sign(player.vx); player.vx=0; }
+  player.y += player.vy; let grounded=false;
+  if (solidAtRect(player.x,player.y,player.w,player.h)){ player.y-=player.vy; while(!solidAtRect(player.x,player.y+Math.sign(player.vy),player.w,player.h)) player.y+=Math.sign(player.vy); if(player.vy>0) grounded=true; player.vy=0; }
+  else if (player.vy>0 && onewayAtRect(player.x,player.y,player.w,player.h) && !input.down){
+    const yBottom=Math.floor((player.y+player.h-1)/TILE)*TILE;
+    if ((player.y+player.h)-yBottom<8){ player.y=yBottom-player.h; grounded=true; player.vy=0; }
+  }
+  player.onGround=grounded;
+}
+function updatePlayer(dt){
+  const s=player.stats;
+  const ax=(input.left?-s.run:0)+(input.right?s.run:0);
+  player.vx += ax*2; player.vx *= 0.86; if (Math.abs(player.vx)<0.02) player.vx=0;
+  if (input.left) player.dir=-1; if (input.right) player.dir=1;
+
+  const justPressed = input.jump && !input._prevJump; input._prevJump = input.jump;
+  if (player.onGround){ player.jumpsLeft=2; }
+  if (justPressed){
+    if (player.onGround){ player.vy=-s.jump; player.jumpsLeft=1; SFX.jump(); }
+    else if (player.jumpsLeft>0){ player.vy=-s.jump; player.jumpsLeft--; SFX.jump(); }
+  }
+
+  movePlayer();
+
+  if (player.y > currentLevel.h*TILE + 120){ loseLife('You fell!'); }
+  const tx=Math.floor((player.x+player.w/2)/TILE);
+  const ty=Math.floor((player.y+player.h/2)/TILE);
+  const t=currentLevel.grid[ty] && currentLevel.grid[ty][tx];
+  if (t===11){ respawn={x:tx*TILE, y:(ty-1)*TILE}; currentLevel.grid[ty][tx]=0; SFX.checkpoint(); }
+  if (t===9){ winLevel(); }
+
+  camera.x += (player.x - (W/2 - player.w/2) - camera.x) * 0.12; camera.x=Math.max(0,Math.min(camera.x,currentLevel.w*TILE-W));
+  camera.y += (player.y - (H/2) - camera.y) * 0.08; camera.y=Math.max(0,Math.min(camera.y,currentLevel.h*TILE-H));
+
+  const moving=Math.abs(player.vx)>0.2, jumping=!player.onGround;
+  player.anim += moving? dt*0.3 : dt*0.1;
+  player.frame = moving && !jumping ? (Math.floor(player.anim*6)%2) : 0;
+}
+function loseLife(msg){ lives--; SFX.death(); stopMusic(); overlay.msg = (msg||'You fell!') + '\nLives left: ' + String(Math.max(lives,0)); gameState='death'; }
+function respawnPlayer(){ Object.assign(player,{x:respawn.x,y:respawn.y,vx:0,vy:0,onGround:false}); startMusic(); gameState='playing'; }
+function winLevel(){ if (gameState!=='playing') return; SFX.win(); stopMusic(); if (progress.unlocked<levels.length) progress.unlocked++; progress.coinsTotal+=coinsCollected; saveProgress(); overlay.msg='Level Clear!'; gameState='levelclear'; }
+
+function spawnCoin(x,y){ ents.push({type:'coin',x:x*TILE+6,y:y*TILE+6,w:12,h:12,t:0}); }
+function populate(lvl){ ents.length=0; coinsCollected=0; for(let y=0;y<lvl.h;y++) for(let x=0;x<lvl.w;x++){ if (lvl.grid[y][x]===10){ spawnCoin(x,y); lvl.grid[y][x]=0; } } }
+
+function updateEntities(dt){
+  for(let i=ents.length-1;i>=0;i--){ const e=ents[i]; if (e.type==='coin'){ e.t+=dt; if (AABB(e,player)){ coinsCollected++; ents.splice(i,1); SFX.coin(); } } }
+}
+
+// DRAW
+function rect(x,y,w,h,style){ ctx.fillStyle=style; ctx.fillRect(Math.floor(x),Math.floor(y),Math.floor(w),Math.floor(h)); }
+function drawScenery(){
+  ctx.fillStyle=tex.sky; ctx.fillRect(0,0,W,H);
+  for(const s of scenery){
+    const sx = s.x - camera.x*(s.cloud?0.2:0.3);
+    if (s.cloud){ rect((sx%(currentLevel.w*TILE))-50, s.y, s.w, s.h, '#ffffff30'); rect(((sx+30)%(currentLevel.w*TILE))-50, s.y+22, s.w, s.h, '#ffffff30'); }
+    else if (s.hill){ ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(sx%(currentLevel.w*TILE), s.y, s.r, 0, Math.PI*2); ctx.fill(); }
+  }
+}
+function drawWorld(){
+  const x0=Math.floor(camera.x/TILE), x1=Math.ceil((camera.x+W)/TILE);
+  const y0=Math.floor(camera.y/TILE), y1=Math.ceil((camera.y+H)/TILE);
+  for(let ty=y0; ty<y1; ty++) for(let tx=x0; tx<x1; tx++){
+    const t=(currentLevel.grid[ty] && currentLevel.grid[ty][tx])|0;
+    const sx=tx*TILE - camera.x, sy=ty*TILE - camera.y;
+    if (t===1){ rect(sx,sy,TILE,TILE,'#5c3b1a'); rect(sx+2,sy+2,TILE-4,TILE-4,tex.solid); }
+    else if (t===8){ rect(sx, sy+TILE/2, TILE, 8, tex.one); rect(sx, sy+TILE/2-2, TILE, 2, '#1a1a1a'); }
+    else if (t===9){ rect(sx+6,sy-12,4,36,'#663'); rect(sx+10,sy-10,10,10,tex.flag); }
+    else if (t===11){ rect(sx+8,sy-12,4,30, tex.check); rect(sx+6,sy-14,8,4,'#fff'); }
+  }
+}
+function drawEntities(){
+  for(const e of ents){
+    if (e.type==='coin'){ const x=e.x-camera.x, y=e.y-camera.y; const w=12*(0.6+0.4*Math.abs(Math.sin(e.t*0.25))); rect(x+(12-w)/2, y, w, 12, tex.coin); }
+  }
+  const px=player.x - camera.x, py=player.y - camera.y;
+  ctx.fillStyle='#c33';
+  if (player.dir===1){ ctx.beginPath(); ctx.moveTo(px,py+6); ctx.lineTo(px-10,py+14); ctx.lineTo(px,py+18); ctx.closePath(); ctx.fill(); }
+  else { ctx.beginPath(); ctx.moveTo(px+player.w,py+6); ctx.lineTo(px+player.w+10,py+14); ctx.lineTo(px+player.w,py+18); ctx.closePath(); ctx.fill(); }
+  ctx.fillStyle='#bbb';
+  const moving=Math.abs(player.vx)>0.2, jumping=!player.onGround;
+  if (moving && !jumping && player.frame===0){ ctx.fillRect(px, py+6, player.w, player.h-6); ctx.fillRect(px-2, py+player.h-4, 6,4); ctx.fillRect(px+player.w-4, py+player.h-4, 6,4); }
+  else if (moving && !jumping && player.frame===1){ ctx.fillRect(px, py+6, player.w, player.h-6); ctx.fillRect(px, py+player.h-4, 6,4); ctx.fillRect(px+player.w-2, py+player.h-4, 6,4); }
+  else { ctx.fillRect(px, py+4, player.w, player.h-4); }
+  ctx.fillStyle='#ccc'; ctx.fillRect(px+2, py, 5,5); ctx.fillRect(px+player.w-7, py, 5,5);
+  ctx.fillStyle='#222'; ctx.fillRect(px+4, py+6, 2,2); ctx.fillRect(px+player.w-6, py+6, 2,2);
+  ctx.fillStyle='#e66'; ctx.fillRect(px+player.w/2-1, py+9, 2,2);
+}
+function drawHUD(){ ctx.fillStyle='#0008'; ctx.fillRect(8,8,260,44); ctx.fillStyle='#fff'; ctx.font='14px monospace'; ctx.fillText('Coins: '+coinsCollected, 16,28); ctx.fillText('Lives: '+lives, 120,28); }
+
+// Overlay
+const overlay={msg:''};
+function drawOverlay(){
+  if (gameState==='death' || gameState==='levelclear' || gameState==='gameover'){
+    ctx.fillStyle='#0009'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff'; ctx.font='24px monospace';
+    const lines = overlay.msg.split('\n'); lines.forEach((ln,i)=> ctx.fillText(ln, W/2 - ctx.measureText(ln).width/2, H/2 + i*28));
+    let tip = (gameState==='gameover')? 'Tap/press to return to menu' : 'Tap/press to continue';
+    ctx.font='16px monospace'; ctx.fillText(tip, W/2 - ctx.measureText(tip).width/2, H/2 + lines.length*28 + 20);
+  }
+}
+
+// FLOW
+function showMenu(){ gameState='menu'; stopMusic(); hideAllPanels(); showPanel(menu); updateLevelButtons(); }
+function startGame(){
+  log('startGame');
+  currentLevel = levels[currentLevelIndex]; respawn={x:6*TILE,y:6*TILE}; lives=3;
+  populate(currentLevel); resetPlayer(); buildScenery(); resumeAudio(); startMusic(); gameState='playing';
+  log('-> playing');
+}
+
+// Init
+initTex(); buildScenery(); updateLevelButtons();
+log('Init complete');
+
+// Failsafe: auto-start after 1.5s in case Play is blocked by iOS quirks
+setTimeout(function(){
+  if (gameState==='menu'){
+    log('Failsafe autostart');
+    hideAllPanels(); startGame();
+  }
+}, 1500);
+
+// Loop
+let last=0;
+function frame(t){
+  const dt=(t-last)/16.6667; last=t;
+  if (gameState==='playing'){
+    ctx.clearRect(0,0,W,H);
+    updatePlayer(dt); updateEntities(dt);
+    drawScenery(); drawWorld(); drawEntities(); drawHUD();
+  } else if (gameState==='death' || gameState==='levelclear' || gameState==='gameover'){
+    ctx.clearRect(0,0,W,H);
+    drawScenery(); drawWorld(); drawEntities(); drawHUD(); drawOverlay();
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function proceedOverlay(){
+  if (gameState==='death'){ if (lives>0){ respawnPlayer(); } else { overlay.msg='Game Over'; gameState='gameover'; } }
+  else if (gameState==='levelclear'){ if (progress.unlocked < levels.length) currentLevelIndex = progress.unlocked-1; showMenu(); }
+  else if (gameState==='gameover'){ showMenu(); }
+}
+canvas.addEventListener('mousedown', ()=>{ proceedOverlay(); });
+canvas.addEventListener('touchend', (e)=>{ e.preventDefault(); proceedOverlay(); }, {passive:false});
+window.addEventListener('keydown', (e)=>{ if (['Enter','Space','KeyZ'].includes(e.code)) proceedOverlay(); if (e.code==='Escape' && gameState!=='playing') showMenu(); });
+window.addEventListener('keydown', (e)=>{ if (e.code==='Escape' && gameState==='playing') showMenu(); });
+
+// Helpers
+function AABB(a,b){ return !(a.x+a.w<b.x || b.x+b.w<a.x || a.y+a.h<b.y || b.y+b.h<a.y); }
+
+});
+</script>
+</body>
+</html>
